@@ -1,7 +1,11 @@
+use crate::computable::Precision;
 use crate::{Computable, Problem, Rational};
 use num::bigint::{BigInt, BigUint, Sign};
+use std::cmp::Ordering;
 
 mod convert;
+#[cfg(test)]
+mod normal_reference;
 mod test;
 
 #[derive(Clone, Debug)]
@@ -89,6 +93,73 @@ mod unsigned {
 
 use std::sync::LazyLock;
 static LN10: LazyLock<Class> = LazyLock::new(|| Ln(Rational::new(10)));
+
+/// Largest |x| for which we evaluate Φ(x) / Φ⁻¹. Beyond this the erf series needs
+/// impractically many terms and Φ is within ~10⁻²³ of 0 or 1.
+const PNORM_MAX_ABS: f64 = 10.0;
+/// Tolerance (in bits) for the exact CR comparisons guarding qnorm's domain.
+const DEFAULT_COMPARE_TOLERANCE: Precision = -1000;
+
+// Φ(10) and Φ(−10) = 1 − Φ(10), the probabilities at the ±10 cap. Φ⁻¹(p) is in
+// range exactly when p lies strictly inside (cap_lo, cap_hi).
+fn pnorm_cap_hi() -> Computable {
+    Computable::integer(BigInt::from(10)).pnorm()
+}
+fn pnorm_cap_lo() -> Computable {
+    Computable::one().add(pnorm_cap_hi().negate())
+}
+
+/// Acklam's rational approximation to Φ⁻¹(p) (|error| ≲ 1.2e-9). Used only to seed
+/// the exact CR inversion, so this accuracy is ample.
+// Constants are Acklam's published 16-figure values, kept verbatim even though the
+// last figure is below f64's resolution.
+#[allow(clippy::excessive_precision)]
+fn qnorm_approx(p: f64) -> f64 {
+    const A: [f64; 6] = [
+        -3.969683028665376e+01,
+        2.209460984245205e+02,
+        -2.759285104469687e+02,
+        1.383577518672690e+02,
+        -3.066479806614716e+01,
+        2.506628277459239e+00,
+    ];
+    const B: [f64; 5] = [
+        -5.447609879822406e+01,
+        1.615858368580409e+02,
+        -1.556989798598866e+02,
+        6.680131188771972e+01,
+        -1.328068155288572e+01,
+    ];
+    const C: [f64; 6] = [
+        -7.784894002430293e-03,
+        -3.223964580411365e-01,
+        -2.400758277161838e+00,
+        -2.549732539343734e+00,
+        4.374664141464968e+00,
+        2.938163982698783e+00,
+    ];
+    const D: [f64; 4] = [
+        7.784695709041462e-03,
+        3.224671290700398e-01,
+        2.445134137142996e+00,
+        3.754408661907416e+00,
+    ];
+    const P_LOW: f64 = 0.02425;
+    if p < P_LOW {
+        let q = (-2.0 * p.ln()).sqrt();
+        (((((C[0] * q + C[1]) * q + C[2]) * q + C[3]) * q + C[4]) * q + C[5])
+            / ((((D[0] * q + D[1]) * q + D[2]) * q + D[3]) * q + 1.0)
+    } else if p <= 1.0 - P_LOW {
+        let q = p - 0.5;
+        let r = q * q;
+        (((((A[0] * r + A[1]) * r + A[2]) * r + A[3]) * r + A[4]) * r + A[5]) * q
+            / (((((B[0] * r + B[1]) * r + B[2]) * r + B[3]) * r + B[4]) * r + 1.0)
+    } else {
+        let q = (-2.0 * (1.0 - p).ln()).sqrt();
+        -(((((C[0] * q + C[1]) * q + C[2]) * q + C[3]) * q + C[4]) * q + C[5])
+            / ((((D[0] * q + D[1]) * q + D[2]) * q + D[3]) * q + 1.0)
+    }
+}
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -570,6 +641,111 @@ impl Real {
         }
 
         Ok(self.make_computable(Computable::ln))
+    }
+
+    /// The error function, erf(x) = (2/√π) ∫₀ˣ e^(−t²) dt. Defined for every real x;
+    /// erf(0) = 0 exactly, otherwise Irrational.
+    pub fn erf(self) -> Real {
+        if self.definitely_zero() {
+            return Self::zero();
+        }
+        self.make_computable(Computable::erf)
+    }
+
+    /// Standard normal CDF, Φ(x) = ½(1 + erf(x/√2)). Φ(0) = ½ exactly; otherwise
+    /// Irrational. The argument is capped at ±[`PNORM_MAX_ABS`]; beyond that Φ is
+    /// within ~10⁻²³ of 0 or 1 and the erf series is impractically slow, so we
+    /// reject rather than hang ([`Problem::Exhausted`]).
+    pub fn pnorm(self) -> Result<Real, Problem> {
+        if self.definitely_zero() {
+            return Ok(Self::new(rationals::HALF.clone()));
+        }
+        let xd: f64 = self.clone().into();
+        if !xd.is_finite() || xd.abs() > PNORM_MAX_ABS {
+            return Err(Problem::Exhausted);
+        }
+        Ok(self.make_computable(Computable::pnorm))
+    }
+
+    /// Standard normal density, φ(x) = e^(−x²/2) / √(2π). Always Irrational. Like
+    /// [`pnorm`] the argument is capped at ±[`PNORM_MAX_ABS`]; beyond that φ is below
+    /// ~10⁻²³ and evaluating e^(−x²/2) grows impractically expensive, so we reject
+    /// ([`Problem::Exhausted`]) rather than risk hanging.
+    ///
+    /// [`pnorm`]: Real::pnorm
+    pub fn dnorm(self) -> Result<Real, Problem> {
+        let xd: f64 = self.clone().into();
+        if !xd.is_finite() || xd.abs() > PNORM_MAX_ABS {
+            return Err(Problem::Exhausted);
+        }
+        Ok(self.make_computable(Computable::dnorm))
+    }
+
+    /// Standard normal quantile, Φ⁻¹(p) for p in (0, 1) — the inverse of [`pnorm`].
+    ///
+    /// We invert the strictly-increasing CDF with a dedicated Newton iteration using
+    /// the analytic derivative φ (see [`Computable::normal_quantile`]), seeded from a
+    /// double-precision estimate. Returns [`Problem::NotANumber`] for p ∉ (0, 1) and
+    /// [`Problem::Exhausted`] for p so close to 0 or 1 that Φ⁻¹(p) would exceed the
+    /// ±[`PNORM_MAX_ABS`] cap.
+    ///
+    /// [`pnorm`]: Real::pnorm
+    pub fn qnorm(self) -> Result<Real, Problem> {
+        // Domain: p must lie in (0, 1).
+        if self.best_sign() != Sign::Plus {
+            return Err(Problem::NotANumber); // p <= 0
+        }
+        if self == *rationals::HALF {
+            return Ok(Self::zero()); // Φ⁻¹(½) = 0 exactly
+        }
+        if self.is_rational() && self.rational >= *rationals::ONE {
+            return Err(Problem::NotANumber); // p >= 1
+        }
+
+        let folded = self.clone().fold();
+        // p >= 1 for the non-rational case, decided by exact CR comparison.
+        if folded.compare_absolute(&Computable::one(), DEFAULT_COMPARE_TOLERANCE) != Ordering::Less
+        {
+            return Err(Problem::NotANumber);
+        }
+        // p must lie strictly inside (Φ(−cap), Φ(cap)); outside that, Φ⁻¹(p) would
+        // exceed ±cap. Compare against the cap probabilities directly -- a double
+        // seed is unreliable in the extreme tails (doubleValue underflows to 0 or
+        // rounds to 1).
+        if folded.compare_absolute(&pnorm_cap_lo(), DEFAULT_COMPARE_TOLERANCE) != Ordering::Greater {
+            return Err(Problem::Exhausted); // too close to 0
+        }
+        if folded.compare_absolute(&pnorm_cap_hi(), DEFAULT_COMPARE_TOLERANCE) != Ordering::Less {
+            return Err(Problem::Exhausted); // too close to 1
+        }
+
+        // Seed: work in the small tail (≤ ½, well resolved as a double). doubleValue
+        // rounds p to exactly 1.0 once p is within ~1e-16 of 1, so compute 1 − p
+        // EXACTLY as a Real first, then convert. Solve Φ(y) = p_small for y ≤ 0, then
+        // Φ⁻¹(p) = ±y by the symmetry Φ⁻¹(p) = −Φ⁻¹(1 − p).
+        let p_f64: f64 = self.clone().into();
+        let upper_half = p_f64 > 0.5;
+        let p_small = if upper_half {
+            let one_minus = Self::new(Rational::one()) - self.clone();
+            let v: f64 = one_minus.into();
+            v.max(1e-300)
+        } else {
+            p_f64.max(1e-300)
+        };
+        let y = qnorm_approx(p_small); // ≈ negative
+        let seed = (if upper_half { -y } else { y }).clamp(-PNORM_MAX_ABS, PNORM_MAX_ABS);
+        // Acklam is good to ~1.2e-9 < 2⁻²⁹; claim only 2⁻²⁴ so the seed honours
+        // approx's <1 ulp contract at the Newton recursion's base case.
+        let seed_prec: Precision = -24;
+        let seed_int = BigInt::from((seed * f64::from(1u32 << 24)).round() as i64);
+
+        let q = Computable::normal_quantile(folded, seed_int, seed_prec);
+        Ok(Self {
+            rational: Rational::one(),
+            class: Irrational,
+            computable: q,
+            signal: None,
+        })
     }
 
     /// The sine of this Real.
@@ -1288,3 +1464,4 @@ impl PartialEq<Real> for Rational {
         other.class == Class::One && *self == other.rational
     }
 }
+

@@ -1,6 +1,7 @@
 use crate::Computable;
 use crate::Rational;
 use crate::computable::{Precision, Signal, scale, shift, should_stop, signed};
+use num::ToPrimitive;
 use num::bigint::{Sign, ToBigInt};
 use num::{BigInt, BigUint, Signed};
 use num::{One, Zero};
@@ -21,6 +22,12 @@ pub(super) enum Approximation {
     PrescaledLn(Computable),
     IntegralAtan(BigInt),
     PrescaledCos(Computable),
+    ErfSeries(Computable),
+    NormalQuantile {
+        p: Computable,
+        seed: BigInt,
+        seed_prec: Precision,
+    },
 }
 
 impl Approximation {
@@ -41,6 +48,12 @@ impl Approximation {
             PrescaledLn(c) => ln(signal, c, p),
             IntegralAtan(i) => atan(signal, i, p),
             PrescaledCos(c) => cos(signal, c, p),
+            ErfSeries(c) => erf_series(signal, c, p),
+            NormalQuantile {
+                p: prob,
+                seed,
+                seed_prec,
+            } => normal_quantile(signal, prob, seed, *seed_prec, p),
         }
     }
 }
@@ -396,4 +409,104 @@ fn atan(signal: &Option<Signal>, i: &BigInt, p: Precision) -> BigInt {
     }
 
     scale(sum, calc_precision - p)
+}
+
+// Convert a (non-negative) BigInt to a Precision, saturating on overflow. Only
+// fed by erf_series's term/magnitude bounds, which are tiny for capped inputs.
+fn to_prec(n: &BigInt) -> Precision {
+    n.to_i32().unwrap_or(Precision::MAX)
+}
+
+// S(x) = Σ_{n≥0} 2ⁿ·x^(2n+1)/(2n+1)!!, the cancellation-free core of erf(x) (see
+// Computable::erf). Every term shares x's sign and the ratio a_{n+1}/a_n =
+// 2x²/(2n+3) is strictly decreasing, so once a term shrinks past its predecessor
+// the entire remainder is bounded by a geometric series. S(x) itself grows like
+// e^(x²); the e^(−x²) factor applied by erf cancels it.
+fn erf_series(signal: &Option<Signal>, op: &Computable, p: Precision) -> BigInt {
+    let rough_x = op.approx_signal(signal, -10); // ≈ x·2¹⁰
+    let x_sq_approx = (&rough_x * &rough_x) >> 20; // ≈ x²  (≥ 0)
+
+    // Conservative upper bound on the number of terms: ~x² (to reach the peak)
+    // plus the requested precision. Only feeds the guard-bit count logarithmically.
+    let n_estimate = {
+        let e = &x_sq_approx + BigInt::from(-p) + BigInt::from(10);
+        if e < BigInt::one() { BigInt::one() } else { e }
+    };
+    // Guard bits must cover BOTH the term count (rounding accumulates over the
+    // recurrence) AND the magnitude of the largest partial sum. The all-positive
+    // series peaks at S = (√π/2)·e^(x²)·erf(x) < e^(x²), so msd(S) ≤ x²·log₂(e).
+    // 3/2 > log₂(e) gives a safe upper bound.
+    let magnitude_bits = to_prec(&((&x_sq_approx * BigInt::from(3)) / BigInt::from(2))) + 2;
+    let guard_bits = (n_estimate.magnitude().bits() as Precision) + magnitude_bits + 4;
+    let calc_precision = p - guard_bits;
+    let op_prec = calc_precision - 8; // a bit extra for x itself
+    let op_appr = op.approx_signal(signal, op_prec);
+    let max_trunc_error = signed::ONE.deref() << (p - 4 - calc_precision);
+
+    let mut n: i64 = 0;
+    let mut current_term = scale(op_appr.clone(), op_prec - calc_precision); // a₀ = x
+    let mut current_sum = current_term.clone();
+    loop {
+        if should_stop(signal) {
+            break;
+        }
+        let prev = current_term;
+        // a_{n+1} = a_n · x · x · 2/(2n+3)
+        let mut t = scale(&prev * &op_appr, op_prec);
+        t = scale(t * &op_appr, op_prec);
+        t = (t * signed::TWO.deref()) / BigInt::from(2 * n + 3);
+        n += 1;
+        if t.is_zero() {
+            break; // x == 0 or underflow
+        }
+        let prev_abs = prev.abs();
+        let cur_abs = t.abs();
+        if cur_abs < prev_abs {
+            // Past the peak (ratio < 1): the tail from t onward, t·Σρᵏ, is
+            // ≤ cur_abs·prev_abs/(prev_abs − cur_abs). Stop before adding t.
+            let denom = &prev_abs - &cur_abs;
+            if &cur_abs * &prev_abs < &max_trunc_error * &denom {
+                break;
+            }
+        }
+        current_sum += &t;
+        current_term = t;
+    }
+    scale(current_sum, calc_precision - p)
+}
+
+// |Φ⁻¹| < cap ≤ 10 ⇒ the result's msd is ≤ 5 (with slop). Like Sqrt's result_msd,
+// this only schedules the half-precision recursion; an over-estimate merely adds a
+// Newton level, never wrong digits.
+const RESULT_MSD_BOUND: Precision = 5;
+
+// Φ⁻¹(p), the standard-normal quantile, by Newton's method with the *analytic*
+// derivative:  x_{n+1} = x_n − (Φ(x_n) − p) / φ(x_n).  This avoids inverting Φ with
+// a generic monotone inverter: Newton with the exact derivative is self-correcting
+// and never estimates the derivative numerically, so it stays robust where Φ is
+// nearly flat (the deep tails). Structure mirrors Sqrt: recurse at ~half precision
+// (bottoming out at the coarse double `seed`) then do one Newton step, which
+// quadratically doubles the correct digits.
+fn normal_quantile(
+    signal: &Option<Signal>,
+    p: &Computable,
+    seed: &BigInt,
+    seed_prec: Precision,
+    prec: Precision,
+) -> BigInt {
+    // Base case: the coarse double seed, scaled to the requested precision.
+    if prec >= seed_prec || should_stop(signal) {
+        return scale(seed.clone(), seed_prec - prec);
+    }
+    // x_n at ~half precision; the recursion bottoms out at the seed once apprPrec is
+    // coarse enough (apprPrec is always coarser than prec here).
+    let appr_prec = (RESULT_MSD_BOUND + prec) / 2 - 6;
+    let xn_int = normal_quantile(signal, p, seed, seed_prec, appr_prec);
+    let xn = Computable::integer(xn_int).shift_left(appr_prec);
+    let fx = xn.clone().pnorm(); // Φ(x_n)
+    let phi_xn = xn.clone().dnorm(); // φ(x_n)
+    let x_next = xn.subtract(fx.subtract(p.clone()).divide(phi_xn));
+    // Evaluate two bits beyond and round, to absorb the Newton truncation and stay
+    // within the <1 ulp approx contract.
+    (x_next.approx_signal(signal, prec - 2) + signed::TWO.deref()) >> 2
 }
