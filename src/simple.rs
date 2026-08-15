@@ -1,3 +1,40 @@
+//! A Lisp-like expression parser for mathematical expressions.
+//!
+//! This module parses and evaluates prefix-notation expressions with operators like
+//! `+`, `-`, `*`, `/`, `sqrt`, `sin`, `cos`, `pow`, etc.
+//!
+//! # Examples
+//!
+//! Basic arithmetic:
+//!
+//! ```
+//! # use realistic::Simple;
+//! use std::collections::HashMap;
+//! let expr: Simple = "(+ 1 2 3)".parse().unwrap();
+//! let result = expr.evaluate(&HashMap::new()).unwrap();
+//! assert_eq!(result.to_string(), "6");
+//! ```
+//!
+//! Nested expressions:
+//!
+//! ```
+//! # use realistic::Simple;
+//! use std::collections::HashMap;
+//! let expr: Simple = "(* (+ 1 2) (- 5 3))".parse().unwrap();
+//! let result = expr.evaluate(&HashMap::new()).unwrap();
+//! assert_eq!(result.to_string(), "6");
+//! ```
+//!
+//! Mathematical constants and functions:
+//!
+//! ```
+//! # use realistic::Simple;
+//! use std::collections::HashMap;
+//! let expr: Simple = "(√ (+ pi pi))".parse().unwrap();
+//! let result = expr.evaluate(&HashMap::new()).unwrap();
+//! assert_eq!(format!("{result:.4e}"), "2.5066e0");
+//! ```
+
 use crate::{Problem, Rational, Real};
 use std::collections::HashMap;
 use std::iter::Peekable;
@@ -36,8 +73,23 @@ impl Operand {
             Operand::SubExpression(xpr) => xpr.evaluate(names),
         }
     }
+
+    fn literal(&self) -> Option<&Rational> {
+        match self {
+            Operand::Literal(n) => Some(n),
+            _ => None,
+        }
+    }
 }
 
+/// An expression consisting of an operator and operands.
+/// These are typically constructed by parsing a string.
+///
+/// ```rust
+/// # use realistic::Simple;
+/// let expression: Simple = "(+ 1 4)".parse().unwrap();
+/// assert_eq!(format!("{:?}", expression), "Simple { op: Plus, operands: [Literal(Rational { sign: Plus, numerator: 1, denominator: 1 }), Literal(Rational { sign: Plus, numerator: 4, denominator: 1 })] }");
+/// ```
 #[derive(Clone, Debug, PartialEq)]
 pub struct Simple {
     op: Operator,
@@ -59,13 +111,10 @@ fn parse_problem(problem: Problem) -> &'static str {
 
 impl Simple {
     fn lookup(name: &str, names: &Symbols) -> Result<Real, Problem> {
-        if let Some(value) = names.get(name) {
-            return Ok(value.clone());
-        }
         match name {
             "pi" => Ok(Real::pi()),
             "e" => Ok(Real::e()),
-            _ => Err(Problem::NotFound),
+            _ => names.get(name).cloned().ok_or(Problem::NotFound),
         }
     }
 
@@ -73,8 +122,22 @@ impl Simple {
         use Operator::*;
         match self.op {
             Plus => {
-                let mut value = Real::zero();
-                for operand in &self.operands {
+                if let Some(first) = self.operands.first().and_then(Operand::literal) {
+                    let mut value = first.clone();
+                    let literals = self.operands.iter().skip(1);
+                    if literals.clone().all(|operand| operand.literal().is_some()) {
+                        for operand in literals {
+                            value = value + operand.literal().unwrap();
+                        }
+                        return Ok(Real::new(value));
+                    }
+                }
+                let mut operands = self.operands.iter();
+                let Some(first) = operands.next() else {
+                    return Ok(Real::zero());
+                };
+                let mut value = first.value(names)?;
+                for operand in operands {
                     value = value + operand.value(names)?;
                 }
                 Ok(value)
@@ -83,10 +146,23 @@ impl Simple {
                 0 => Err(Problem::InsufficientParameters),
                 1 => {
                     let operand = self.operands.first().unwrap();
+                    if let Some(literal) = operand.literal() {
+                        return Ok(Real::new(-literal.clone()));
+                    }
                     let value = -(operand.value(names)?);
                     Ok(value)
                 }
                 _ => {
+                    if let Some(first) = self.operands.first().and_then(Operand::literal) {
+                        let mut value = first.clone();
+                        let literals = self.operands.iter().skip(1);
+                        if literals.clone().all(|operand| operand.literal().is_some()) {
+                            for operand in literals {
+                                value = value - operand.literal().unwrap();
+                            }
+                            return Ok(Real::new(value));
+                        }
+                    }
                     let mut value: Real = self.operands.first().unwrap().value(names)?;
                     let operands = self.operands.iter().skip(1);
                     for operand in operands {
@@ -96,8 +172,22 @@ impl Simple {
                 }
             },
             Star => {
-                let mut value = Real::new(Rational::one());
-                for operand in &self.operands {
+                if let Some(first) = self.operands.first().and_then(Operand::literal) {
+                    let mut value = first.clone();
+                    let literals = self.operands.iter().skip(1);
+                    if literals.clone().all(|operand| operand.literal().is_some()) {
+                        for operand in literals {
+                            value = value * operand.literal().unwrap();
+                        }
+                        return Ok(Real::new(value));
+                    }
+                }
+                let mut operands = self.operands.iter();
+                let Some(first) = operands.next() else {
+                    return Ok(Real::new(Rational::one()));
+                };
+                let mut value = first.value(names)?;
+                for operand in operands {
                     value = value * operand.value(names)?;
                 }
                 Ok(value)
@@ -106,9 +196,26 @@ impl Simple {
                 0 => Err(Problem::InsufficientParameters),
                 1 => {
                     let operand = self.operands.first().unwrap();
+                    if let Some(literal) = operand.literal() {
+                        return Ok(Real::new(literal.clone().inverse()?));
+                    }
                     operand.value(names)?.inverse()
                 }
                 _ => {
+                    if let Some(first) = self.operands.first().and_then(Operand::literal) {
+                        let mut value = first.clone();
+                        let literals = self.operands.iter().skip(1);
+                        if literals.clone().all(|operand| operand.literal().is_some()) {
+                            for operand in literals {
+                                let literal = operand.literal().unwrap();
+                                if literal.sign() == num::bigint::Sign::NoSign {
+                                    return Err(Problem::DivideByZero);
+                                }
+                                value = value / literal;
+                            }
+                            return Ok(Real::new(value));
+                        }
+                    }
                     let mut value: Real = self.operands.first().unwrap().value(names)?;
                     let operands = self.operands.iter().skip(1);
                     for operand in operands {
@@ -187,28 +294,32 @@ impl Simple {
         }
     }
 
-    fn operator(chars: &mut Peekable<Chars>) -> Result<Operator, &'static str> {
-        let mut op = String::new();
-
-        while let Some(c) = chars.peek() {
-            match c {
-                'A'..='Z' | 'a'..='z' => op.push(*c),
-                _ => break,
+    fn eat_keyword(chars: &mut Peekable<Chars>, suffix: &str) -> bool {
+        for expected in suffix.chars() {
+            match chars.peek() {
+                Some(c) if *c == expected => {
+                    chars.next();
+                }
+                _ => return false,
             }
-            chars.next();
         }
-        op.make_ascii_lowercase();
+        !matches!(chars.peek(), Some('A'..='Z' | 'a'..='z'))
+    }
 
+    fn operator(chars: &mut Peekable<Chars>) -> Result<Operator, &'static str> {
         use Operator::*;
-        match op.as_str() {
-            "log" | "log10" => Ok(Log10),
-            "ln" | "l" => Ok(Ln),
-            "exp" | "e" => Ok(Exp),
-            "sqrt" | "s" => Ok(Sqrt),
-            "cos" => Ok(Cos),
-            "sin" => Ok(Sin),
-            "pow" => Ok(Pow),
-            "tan" => Ok(Tan),
+        let Some(first) = chars.next() else {
+            return Err("No such operator");
+        };
+        match first {
+            'l' if Self::eat_keyword(chars, "og10") || Self::eat_keyword(chars, "og") => Ok(Log10),
+            'l' if Self::eat_keyword(chars, "n") || Self::eat_keyword(chars, "") => Ok(Ln),
+            'e' if Self::eat_keyword(chars, "xp") || Self::eat_keyword(chars, "") => Ok(Exp),
+            's' if Self::eat_keyword(chars, "qrt") || Self::eat_keyword(chars, "") => Ok(Sqrt),
+            'c' if Self::eat_keyword(chars, "os") => Ok(Cos),
+            's' if Self::eat_keyword(chars, "in") => Ok(Sin),
+            'p' if Self::eat_keyword(chars, "ow") => Ok(Pow),
+            't' if Self::eat_keyword(chars, "an") => Ok(Tan),
             _ => Err("No such operator"),
         }
     }
@@ -353,6 +464,28 @@ mod tests {
     fn missing_close() {
         let xpr: Result<Simple, &str> = "(+ (* (e 4) (e 6))".parse();
         assert_eq!(xpr, Err("Incomplete expression"))
+    }
+
+    #[test]
+    fn parse_named_operators() {
+        let cases = [
+            "(ln 5)",
+            "(l 5)",
+            "(log 5)",
+            "(log10 5)",
+            "(exp 5)",
+            "(e 5)",
+            "(sqrt 5)",
+            "(s 5)",
+            "(cos 5)",
+            "(sin 5)",
+            "(tan 5)",
+            "(pow 5 2)",
+        ];
+        for case in cases {
+            let parsed: Result<Simple, &str> = case.parse();
+            assert!(parsed.is_ok(), "{case}");
+        }
     }
 
     #[test]
