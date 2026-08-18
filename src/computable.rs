@@ -342,6 +342,60 @@ impl Computable {
         }
     }
 
+    /// Divide this number by some other number.
+    fn divide(self, other: Computable) -> Computable {
+        self.multiply(other.inverse())
+    }
+
+    /// Subtract some other number from this number.
+    fn subtract(self, other: Computable) -> Computable {
+        self.add(other.negate())
+    }
+
+    /// The error function, erf(x) = (2/√π) ∫₀ˣ e^(−t²) dt.
+    ///
+    /// Computed via the cancellation-free confluent series
+    ///     erf(x) = (2/√π) · e^(−x²) · Σ_{n≥0} 2ⁿ·x^(2n+1)/(2n+1)!!
+    /// (Abramowitz & Stegun 7.1.6). The all-positive series has no sign
+    /// cancellation, so the only approximation error is its geometrically bounded
+    /// tail; the e^(−x²) factor (huge-times-tiny) is left to multiply's precision
+    /// propagation.
+    pub fn erf(self) -> Computable {
+        let series = Self {
+            internal: Box::new(Approximation::ErfSeries(self.clone())),
+            cache: RefCell::new(Cache::Invalid),
+            signal: None,
+        };
+        let gaussian = self.square().negate().exp(); // e^(−x²)
+        let two_over_sqrt_pi = Self::integer(BigInt::from(2)).divide(Self::pi().sqrt());
+        two_over_sqrt_pi.multiply(gaussian).multiply(series)
+    }
+
+    /// Standard normal CDF, Φ(x) = ½(1 + erf(x/√2)).
+    pub fn pnorm(self) -> Computable {
+        let sqrt2 = Self::integer(BigInt::from(2)).sqrt();
+        let z = self.divide(sqrt2);
+        Self::one().add(z.erf()).shift_right(1)
+    }
+
+    /// Standard normal density, φ(x) = e^(−x²/2) / √(2π).
+    pub fn dnorm(self) -> Computable {
+        let neg_half_x_sq = self.square().shift_right(1).negate();
+        let sqrt_2pi = Self::integer(BigInt::from(2)).multiply(Self::pi()).sqrt();
+        neg_half_x_sq.exp().divide(sqrt_2pi)
+    }
+
+    /// Standard-normal quantile Φ⁻¹(p) by Newton's method with the analytic
+    /// derivative φ. `seed` is a coarse approximation of the answer (accurate to
+    /// ~`seed_prec` bits) supplied by the caller as the recursion's base case.
+    pub fn normal_quantile(p: Computable, seed: BigInt, seed_prec: Precision) -> Computable {
+        Self {
+            internal: Box::new(Approximation::NormalQuantile { p, seed, seed_prec }),
+            cache: RefCell::new(Cache::Invalid),
+            signal: None,
+        }
+    }
+
     pub(crate) fn integer(n: BigInt) -> Self {
         Self {
             internal: Box::new(Approximation::Int(n)),
@@ -781,4 +835,145 @@ mod tests {
         let b = scale(ten.clone(), 2);
         assert_eq!(forty, b);
     }
+
+    // erf, pnorm, normal_quantile -- not part of Boehm's original library. Reference
+    // digits are the published decimal expansions of erf at known points (cf. OEIS
+    // A235214 for erf(1)); the all-positive confluent series must reproduce them well
+    // past double precision.
+
+    // Assert |a - b| < ~2^tol.
+    fn assert_close(a: &Computable, b: &Computable, tol: Precision, msg: &str) {
+        assert_eq!(a.compare_absolute(b, tol), Ordering::Equal, "{msg}");
+    }
+
+    #[test]
+    fn erf_known_values() {
+        let zero = Computable::integer(BigInt::zero());
+        assert_close(&zero.erf(), &Computable::integer(BigInt::zero()), -200, "erf(0) = 0");
+
+        let half: Rational = "0.5".parse().unwrap();
+        let r: Rational = "0.5204998778130465376827466538919645287364".parse().unwrap();
+        assert_close(
+            &Computable::rational(half).erf(),
+            &Computable::rational(r),
+            -90,
+            "erf(0.5)",
+        );
+
+        let r: Rational = "0.8427007929497148693412206350826092592960".parse().unwrap();
+        assert_close(
+            &Computable::integer(BigInt::one()).erf(),
+            &Computable::rational(r),
+            -90,
+            "erf(1)",
+        );
+
+        let r: Rational = "0.9953222650189527341620692563672529286108".parse().unwrap();
+        assert_close(
+            &Computable::integer(BigInt::from(2)).erf(),
+            &Computable::rational(r),
+            -80,
+            "erf(2)",
+        );
+
+        // Larger argument: many series terms (peak near n ≈ x²).
+        let r: Rational = "0.9999779095030014145586272238627087484020".parse().unwrap();
+        assert_close(
+            &Computable::integer(BigInt::from(3)).erf(),
+            &Computable::rational(r),
+            -70,
+            "erf(3)",
+        );
+    }
+
+    #[test]
+    fn erf_odd() {
+        // erf is odd; exercises sign handling and deep precision.
+        let x: Rational = "1.3".parse().unwrap();
+        let xc = Computable::rational(x);
+        assert_close(
+            &xc.clone().negate().erf(),
+            &xc.erf().negate(),
+            -300,
+            "erf(-x) = -erf(x)",
+        );
+    }
+
+    #[test]
+    fn erf_deep_precision() {
+        // High-precision evaluation must terminate and stay consistent with the
+        // published 40-digit value.
+        let erf1 = Computable::integer(BigInt::one()).erf();
+        let _ = erf1.approx(-600); // force deep evaluation; must terminate
+        let r: Rational = "0.8427007929497148693412206350826092592960".parse().unwrap();
+        assert_close(&erf1, &Computable::rational(r), -130, "erf(1) deep");
+    }
+
+    #[test]
+    fn pnorm_basic() {
+        // Φ(0) = ½.
+        let half: Rational = "0.5".parse().unwrap();
+        assert_close(
+            &Computable::integer(BigInt::zero()).pnorm(),
+            &Computable::rational(half),
+            -200,
+            "pnorm(0) = 1/2",
+        );
+        // Φ(1) = 0.84134474606854...
+        let r: Rational = "0.8413447460685429485852325456320379224779".parse().unwrap();
+        assert_close(
+            &Computable::integer(BigInt::one()).pnorm(),
+            &Computable::rational(r),
+            -120,
+            "pnorm(1)",
+        );
+    }
+
+    #[test]
+    fn dnorm_known_values() {
+        // φ(0) = 1/√(2π).
+        let r: Rational = "0.39894228040143267793994605993438186847585863".parse().unwrap();
+        assert_close(
+            &Computable::integer(BigInt::zero()).dnorm(),
+            &Computable::rational(r),
+            -120,
+            "dnorm(0)",
+        );
+        let r: Rational = "0.24197072451914334979783019293556065482867197".parse().unwrap();
+        assert_close(
+            &Computable::integer(BigInt::one()).dnorm(),
+            &Computable::rational(r),
+            -120,
+            "dnorm(1)",
+        );
+        let r: Rational = "0.05399096651318805195056420041071358173981454".parse().unwrap();
+        assert_close(
+            &Computable::integer(BigInt::from(2)).dnorm(),
+            &Computable::rational(r),
+            -120,
+            "dnorm(2)",
+        );
+    }
+
+    #[test]
+    fn dnorm_even() {
+        // φ is even: φ(−x) = φ(x).
+        let x: Rational = "1.3".parse().unwrap();
+        let xc = Computable::rational(x);
+        assert_close(&xc.clone().negate().dnorm(), &xc.dnorm(), -300, "dnorm(-x) = dnorm(x)");
+    }
+
+    #[test]
+    fn normal_quantile_inverts_pnorm() {
+        // Φ⁻¹(Φ(2)) = 2 to deep precision, via the analytic-derivative Newton inverter
+        // seeded from a rough double estimate.
+        let two = Computable::integer(BigInt::from(2));
+        let p = two.clone().pnorm();
+        // Seed 1.9999 (≈ 2⁻¹³ from the true answer 2); seed_prec honours that bound.
+        // Newton then quadratically doubles the correct digits up to deep precision.
+        let seed = BigInt::from((1.9999f64 * f64::from(1u32 << 13)).round() as i64);
+        let q = Computable::normal_quantile(p, seed, -13);
+        assert_close(&q, &two, -200, "qnorm(pnorm(2)) = 2");
+    }
 }
+

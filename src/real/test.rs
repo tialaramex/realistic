@@ -274,4 +274,246 @@ mod tests {
             assert_eq!(answer, Rational::new(log));
         }
     }
+
+    // pnorm (standard normal CDF) and qnorm (its quantile). Deep correctness is
+    // pinned to an INDEPENDENT oracle (mpmath) at 1000 digits across the whole ±10
+    // range in `against_mpmath_references`. Round trips (qnorm∘pnorm = id) and
+    // symmetry are cheap self-consistency checks, but they can't catch a
+    // wrong-but-consistent pair, which is why the oracle is the real test.
+    mod normal {
+        use crate::computable::Precision;
+        use crate::real::normal_reference::CASES;
+        use crate::{Computable, Problem, Rational, Real};
+        use num::bigint::{BigInt, BigUint, Sign};
+        use std::cmp::Ordering;
+        use std::ops::Neg;
+
+        // Assert v equals the high-precision decimal reference to within 2^bits, i.e.
+        // far past f64 -- comparison is done on the exact constructive real, not the
+        // lossy (±1 ulp) f64 conversion.
+        fn close(v: Real, decimal: &str, bits: Precision) {
+            let r: Rational = decimal.parse().unwrap();
+            assert_eq!(
+                v.fold().compare_absolute(&Computable::rational(r), bits),
+                Ordering::Equal,
+                "disagrees with {decimal}"
+            );
+        }
+
+        fn ratio(n: i64, d: u64) -> Real {
+            Real::new(Rational::fraction(n, d).unwrap())
+        }
+
+        // Build a Real from arbitrary-size numerator/denominator decimal strings.
+        fn case_real(num: &str, den: &str) -> Real {
+            let n: BigInt = num.parse().unwrap();
+            let d: BigUint = den.parse().unwrap();
+            Real::new(Rational::from_bigint_fraction(n, d).unwrap())
+        }
+
+        // The value truncated toward zero to `n` fractional digits, formatted like
+        // mpmath's `int(floor(|x|·10ⁿ))` rendering used to freeze the references.
+        fn trunc_str(real: &Real, n: usize) -> String {
+            let neg = real.best_sign() == Sign::Minus;
+            let c = real.clone().fold();
+            // Enough bits to resolve n decimal digits (log₂10 ≈ 3.322) plus slack.
+            let bits: Precision = -((n as Precision) * 3322 / 1000 + 64);
+            let appr = c.approx(bits).magnitude().clone(); // ≈ |value|·2^-bits
+            let ten_n: BigInt = num::pow::Pow::pow(BigInt::from(10), n as u32);
+            let scaled = (BigInt::from(appr) * ten_n) >> ((-bits) as usize);
+            let mut s = scaled.to_string();
+            if s.len() <= n {
+                s = format!("{}{}", "0".repeat(n - s.len() + 1), s);
+            }
+            let (int_part, frac_part) = s.split_at(s.len() - n);
+            format!("{}{}.{}", if neg { "-" } else { "" }, int_part, frac_part)
+        }
+
+        // MARK: exact cases
+
+        #[test]
+        fn exact_cases() {
+            // Φ(0) = ½ exactly.
+            assert_eq!(Real::zero().pnorm().unwrap(), Rational::fraction(1, 2).unwrap());
+            // Φ⁻¹(½) = 0 exactly.
+            assert!(ratio(1, 2).qnorm().unwrap().definitely_zero());
+            // erf(0) = 0 exactly.
+            assert!(Real::zero().erf().definitely_zero());
+        }
+
+        // MARK: known values, pinned well past f64 (~38 digits)
+
+        // erf and dnorm at the Real level, against references computed independently
+        // (Python `decimal`) to ~44 digits. pnorm/qnorm get the full 1000-digit
+        // treatment in `against_mpmath_references`; a couple are repeated here only to
+        // confirm the Real wrappers and the entry points line up. Everything is checked
+        // on the exact constructive real -- ~38 digits, more than twice what f64 holds.
+        #[test]
+        fn known_values() {
+            close(ratio(1, 1).erf(), "0.8427007929497148693412206350826092592960", -120);
+            close(
+                Real::from(-1).erf(),
+                "-0.8427007929497148693412206350826092592960",
+                -120,
+            );
+            close(Real::zero().dnorm().unwrap(), "0.39894228040143267793994605993438186847", -120);
+            close(ratio(1, 1).dnorm().unwrap(), "0.24197072451914334979783019293556065482", -120);
+            close(ratio(2, 1).dnorm().unwrap(), "0.05399096651318805195056420041071358173", -120);
+            close(ratio(1, 1).pnorm().unwrap(), "0.84134474606854294858523254563203792247", -120);
+            close(
+                Real::from(-3).pnorm().unwrap(),
+                "0.00134989803163009452665181476759497737",
+                -120,
+            );
+            close(ratio(975, 1000).qnorm().unwrap(), "1.95996398454005423552459443052055152795", -120);
+        }
+
+        // dnorm is the even density; φ(−x) = φ(x) and the ±cap rejects extreme args.
+        #[test]
+        fn density() {
+            let two = ratio(2, 1);
+            let rt = two.clone().dnorm().unwrap().fold();
+            let neg = two.neg().dnorm().unwrap().fold();
+            assert_eq!(
+                rt.compare_absolute(&neg, -200),
+                std::cmp::Ordering::Equal,
+                "dnorm(-2) != dnorm(2)"
+            );
+            let big: Real = 600.into();
+            assert_eq!(big.dnorm().unwrap_err(), Problem::Exhausted);
+        }
+
+        // MARK: deep self-consistency (no external reference needed)
+
+        #[test]
+        fn round_trip_and_symmetry() {
+            // Spans the centre and the moderate tails (qnorm(pnorm(±5)) exercises the
+            // analytic-derivative Newton inverter where Φ is already quite flat).
+            let xs = [
+                ratio(2, 1),
+                (-1).into(),
+                ratio(1, 2),
+                ratio(3, 2),
+                Real::from(4),
+                Real::from(-5),
+            ];
+            for x in xs {
+                // qnorm(pnorm(x)) == x to ~30 digits.
+                let rt = x.clone().pnorm().unwrap().qnorm().unwrap();
+                assert_eq!(
+                    rt.fold().compare_absolute(&x.clone().fold(), -100),
+                    std::cmp::Ordering::Equal,
+                    "round trip failed for {x:?}"
+                );
+                // pnorm(x) + pnorm(-x) == 1 to ~30 digits.
+                let sym = x.clone().pnorm().unwrap() + x.clone().neg().pnorm().unwrap();
+                let one = Real::new(Rational::one());
+                assert_eq!(
+                    sym.fold().compare_absolute(&one.fold(), -100),
+                    std::cmp::Ordering::Equal,
+                    "symmetry failed for {x:?}"
+                );
+            }
+        }
+
+        // MARK: domain
+
+        #[test]
+        fn domain_errors() {
+            assert_eq!(Real::zero().qnorm().unwrap_err(), Problem::NotANumber); // p = 0
+            assert_eq!(ratio(1, 1).qnorm().unwrap_err(), Problem::NotANumber); // p = 1
+            assert_eq!(ratio(2, 1).qnorm().unwrap_err(), Problem::NotANumber); // p > 1
+            let minus_one: Real = (-1).into();
+            assert_eq!(minus_one.qnorm().unwrap_err(), Problem::NotANumber); // p < 0
+        }
+
+        // Sanity cap: |x| past the (deliberately narrow, ±10) range is rejected
+        // instead of running the erf series for ages.
+        #[test]
+        fn input_sanity_cap() {
+            let neg_600: Real = (-600).into();
+            assert_eq!(neg_600.pnorm().unwrap_err(), Problem::Exhausted);
+            let eleven: Real = 11.into();
+            assert_eq!(eleven.pnorm().unwrap_err(), Problem::Exhausted);
+            let hundred: Real = 100.into();
+            assert!(hundred.qnorm().is_err()); // p > 1 anyway, but also out of range
+            let neg_nine: Real = (-9).into();
+            assert!(neg_nine.pnorm().is_ok()); // inside the range still computes
+
+            // Extreme probabilities whose quantile is beyond ±cap must REJECT, not
+            // return the cap boundary (p ≈ 0 / p ≈ 1, where doubleValue underflows to
+            // 0 / rounds to 1). We use clean rationals below/above the cap; Swift uses
+            // e^±1e7 here, but evaluating that CR in this engine is intractable (~14M
+            // bits) without UnifiedReal's symbolic short-circuit, and a rational past
+            // the cap exercises exactly the same rejection branch.
+            let tiny = case_real("1", "1000000000000000000000000000000"); // 1e-30 < cap_lo
+            assert_eq!(tiny.clone().qnorm().unwrap_err(), Problem::Exhausted); // p ≈ 0
+            let near_one = Real::new(Rational::one()) - tiny;
+            assert_eq!(near_one.qnorm().unwrap_err(), Problem::Exhausted); // p ≈ 1
+
+            // A feasible deep tail (|Φ⁻¹| < cap) still computes (≈ -9.26, not -10).
+            let v: f64 = case_real("1", "100000000000000000000").qnorm().unwrap().into();
+            assert!(v > -9.9 && v < -8.5, "qnorm(1e-20) = {v}");
+        }
+
+        // (qnorm correctness in the tails -- where a naive interpolating inverter
+        // would return a bracket endpoint -- is covered to full precision by
+        // `against_mpmath_references` at p = 1/10, 1/100, 1/10⁴ … and by the ±5 round
+        // trips in `round_trip_and_symmetry`, so no separate loose-tolerance tail test
+        // is kept.)
+
+        // Regression: the EXTREME tails near the ±cap, where Φ is dead flat
+        // (φ(9) ≈ 1e-18). These round trips are mathematically EXACT, so we assert
+        // exact CR equality at high precision rather than a double snapshot.
+        #[test]
+        fn extreme_tails() {
+            let prec = -140;
+            // qnorm(pnorm(x)) = x, out to the cap, both signs.
+            for (n, d) in [(99, 10), (90, 10), (70, 10), (-70, 10), (-90, 10), (-99, 10)] {
+                let x = ratio(n, d);
+                let rt = x.clone().pnorm().unwrap().qnorm().unwrap();
+                assert_eq!(
+                    rt.fold().compare_absolute(&x.clone().fold(), prec),
+                    std::cmp::Ordering::Equal,
+                    "qnorm(pnorm({n}/{d}))"
+                );
+            }
+            // pnorm(qnorm(p)) = p for tiny p in BOTH tails (10⁻ᵏ and 1 − 10⁻ᵏ).
+            for k in [8u32, 16, 20] {
+                let den = num::pow::Pow::pow(BigInt::from(10), k).to_string();
+                let lo = case_real("1", &den); // 10⁻ᵏ
+                let rt = lo.clone().qnorm().unwrap().pnorm().unwrap();
+                assert_eq!(
+                    rt.fold().compare_absolute(&lo.clone().fold(), prec),
+                    std::cmp::Ordering::Equal,
+                    "pnorm(qnorm(1e-{k}))"
+                );
+                let hi = Real::new(Rational::one()) - lo; // 1 − 10⁻ᵏ
+                let rt = hi.clone().qnorm().unwrap().pnorm().unwrap();
+                assert_eq!(
+                    rt.fold().compare_absolute(&hi.clone().fold(), prec),
+                    std::cmp::Ordering::Equal,
+                    "pnorm(qnorm(1-1e-{k}))"
+                );
+            }
+        }
+
+        // The real correctness test: 1000 digits against an INDEPENDENT oracle
+        // (mpmath), not self-consistency. Spans the whole ±10 range including the
+        // extremes (pnorm(±10), qnorm out to answers ≈ ±9.97). Compares the engine's
+        // 1000-digit truncation digit-for-digit.
+        #[test]
+        fn against_mpmath_references() {
+            for &(kind, num, den, expected) in CASES {
+                let arg = case_real(num, den);
+                let value = if kind == "pnorm" {
+                    arg.pnorm().unwrap()
+                } else {
+                    arg.qnorm().unwrap()
+                };
+                let got = trunc_str(&value, 1000);
+                assert_eq!(got, expected, "{kind}({num}/{den}) disagrees with mpmath");
+            }
+        }
+    }
 }
